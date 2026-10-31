@@ -121,3 +121,51 @@ class ApplicationDetailResponse(BaseModel):
     updated_at: datetime
     applicable_checklist: List[ChecklistItemStatus]
     historical_aicte_records: Dict[str, Any]
+
+
+# --- Phase 2: Document, OCR & Explainable Flag Schemas ---
+class ValidationFlagRead(BaseModel):
+    id: int
+    application_id: int
+    document_id: Optional[int]
+    rule_id: Optional[int]
+    flag_category: FlagCategory
+    severity: FlagSeverity
+    field_name: Optional[str]
+    reason: str
+    evidence_snippet: Optional[str]
+    page_number: Optional[int]
+    is_advisory: bool
+    is_resolved: bool
+    reviewer_action: Optional[str]
+    reviewer_notes: Optional[str]
+    created_at: datetime
+
+
+class DocumentRead(BaseModel):
+    id: int
+    application_id: int
+    document_type: DocumentType
+    filename: str
+    mime_type: str
+    file_size_bytes: int
+    sha256_hash: str
+    raw_ocr_text: Optional[str]
+    pdf_metadata: Dict[str, Any]
+    extracted_fields: Dict[str, Any]
+    issuing_authority: Optional[str]
+    document_urn_or_id: Optional[str]
+    issue_date: Optional[str]
+    expiry_date: Optional[str]
+    verification_status: VerificationStatus
+    verification_details: Dict[str, Any]
+    uploaded_at: datetime
+
+
+class DocumentUploadResponse(BaseModel):
+    document: DocumentRead
+    flags_generated: List[ValidationFlagRead]
+    duplicate_detected: bool
+    completeness_missing_fields: List[str]
+    message: str
+
