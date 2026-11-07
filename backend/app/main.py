@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import applications, audit, auth, documents, rules
+from app.api import applications, audit, auth, dashboard, documents, rules
 from app.config import settings
 from app.database import init_db_and_seed
 from app.services.sample_pdf_generator import generate_demo_pdfs
@@ -39,6 +39,7 @@ app.include_router(auth.router)
 app.include_router(rules.router)
 app.include_router(applications.router)
 app.include_router(documents.router)
+app.include_router(dashboard.router)
 app.include_router(audit.router)
 
 

@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, EmailStr, Field
 
@@ -207,6 +208,75 @@ class ApplicationValidationReportResponse(BaseModel):
     rectification_steps: List[str]
     advisory_notes: str
     validated_at: datetime
+
+
+# --- Phase 5: Reviewer Dashboard & Decision Schemas (PRD §4.5) ---
+class ReviewerActionEnum(str, Enum):
+    CONFIRMED_DEFICIENCY = "CONFIRMED_DEFICIENCY"
+    DISMISSED_FALSE_POSITIVE = "DISMISSED_FALSE_POSITIVE"
+    REQUEST_RECTIFICATION = "REQUEST_RECTIFICATION"
+
+
+class FlagReviewRequest(BaseModel):
+    action: ReviewerActionEnum
+    reviewer_notes: Optional[str] = Field(
+        default=None,
+        description="Scrutiny notes explaining official reasoning for confirming or dismissing flag.",
+    )
+
+
+class ApplicationDecisionEnum(str, Enum):
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    REQUEST_RECTIFICATION = "REQUEST_RECTIFICATION"
+
+
+class ApplicationDecisionRequest(BaseModel):
+    decision: ApplicationDecisionEnum
+    decision_notes: str = Field(
+        ...,
+        description="Statutory comments by AICTE Scrutiny Committee / Reviewer.",
+    )
+    rectification_notice: Optional[str] = Field(
+        default=None,
+        description="Specific instructions or deadline for the institution if requesting rectification.",
+    )
+
+
+class ApplicationDecisionResponse(BaseModel):
+    application_id: int
+    application_number: str
+    status: ApplicationStatus
+    reviewer_decision: str
+    decision_notes: str
+    reviewed_by: str
+    timestamp: datetime
+
+
+class DashboardApplicationSummary(BaseModel):
+    id: int
+    application_number: str
+    institution_name: str
+    aicte_permanent_id: str
+    category: ApplicationCategory
+    status: ApplicationStatus
+    overall_compliance_score: Optional[float]
+    open_flags_count: int
+    critical_flags_count: int
+    documents_uploaded: int
+    created_at: datetime
+
+
+class DashboardMetricsResponse(BaseModel):
+    total_applications: int
+    status_distribution: Dict[str, int]
+    flag_distribution: Dict[str, int]
+    authority_verification_stats: Dict[str, int]
+    average_compliance_score: float
+    pending_scrutiny_count: int
+    recent_applications: List[DashboardApplicationSummary]
+    recent_open_flags: List[ValidationFlagRead]
+
 
 
 
