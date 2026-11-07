@@ -8,12 +8,17 @@ from app.models.models import Application, ChecklistRule, Document, Institution,
 from app.schemas.schemas import (
     ApplicationCreate,
     ApplicationDetailResponse,
+    ApplicationValidationReportResponse,
+    AuthorityVerificationResponse,
     ChecklistItemStatus,
     InstitutionCreate,
     InstitutionRead,
+    ValidationFlagRead,
 )
 from app.services.audit_service import log_audit_event
+from app.services.rules_engine import run_application_validation_engine
 from app.services.security import get_current_user, require_roles
+from app.services.verification_service import verify_document_with_issuing_authority
 
 router = APIRouter(
     prefix="/api",
@@ -204,4 +209,140 @@ def _build_application_detail(
         updated_at=application.updated_at,
         applicable_checklist=checklist_status,
         historical_aicte_records=institution.historical_records if institution else {},
+    )
+
+
+@router.post(
+    "/applications/{application_id}/verify-all-documents",
+    response_model=List[AuthorityVerificationResponse],
+)
+def verify_all_application_documents(
+    application_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Triggers automated issuing-authority verification for all supporting documents
+    uploaded for this application (PRD §4.3).
+    """
+    app_obj = session.get(Application, application_id)
+    if not app_obj:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    docs = session.exec(
+        select(Document).where(Document.application_id == application_id)
+    ).all()
+
+    results: List[AuthorityVerificationResponse] = []
+    for doc in docs:
+        status_result, details, flags = verify_document_with_issuing_authority(
+            session=session,
+            document=doc,
+            actor_user_id=current_user.id,
+        )
+        results.append(
+            AuthorityVerificationResponse(
+                document_id=doc.id,
+                document_type=doc.document_type,
+                verification_status=status_result,
+                issuing_authority=doc.issuing_authority,
+                details=details,
+                flags_created=[
+                    ValidationFlagRead.model_validate(f, from_attributes=True)
+                    for f in flags
+                ],
+                message=f"Issuing authority verification result: {status_result.value}",
+            )
+        )
+    return results
+
+
+@router.post(
+    "/applications/{application_id}/validate",
+    response_model=ApplicationValidationReportResponse,
+)
+def run_application_validation(
+    application_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Executes the comprehensive regulatory rules engine and cross-document consistency checker
+    (PRD §4.1, §4.2, §4.4 & Deliverables 2 & 4).
+    Evaluates:
+      1. Mandatory category checklist completeness & document expiries
+      2. Multi-document cross-verification & AICTE baseline record consistency
+      3. Infrastructure & laboratory norms
+      4. Quantitative compliance scoring & actionable rectification steps
+    """
+    app_obj = session.get(Application, application_id)
+    if not app_obj:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    report = run_application_validation_engine(
+        session=session,
+        application_id=application_id,
+        actor_user_id=current_user.id,
+    )
+
+    return ApplicationValidationReportResponse(
+        application_id=report["application_id"],
+        application_number=report["application_number"],
+        academic_year=report["academic_year"],
+        category=report["category"],
+        status=report["status"],
+        overall_compliance_score=report["overall_compliance_score"],
+        score_breakdown=report["score_breakdown"],
+        checklist_status=report["checklist_status"],
+        flag_summary=report["flag_summary"],
+        open_flags=[
+            ValidationFlagRead.model_validate(f, from_attributes=True)
+            for f in report["open_flags"]
+        ],
+        rectification_steps=report["rectification_steps"],
+        advisory_notes=report["advisory_notes"],
+        validated_at=report["validated_at"],
+    )
+
+
+@router.get(
+    "/applications/{application_id}/validation-report",
+    response_model=ApplicationValidationReportResponse,
+)
+def get_application_validation_report(
+    application_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Retrieves the structured regulatory compliance report and open deficiency flags
+    for an application (PRD §4.1).
+    """
+    app_obj = session.get(Application, application_id)
+    if not app_obj:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    report = run_application_validation_engine(
+        session=session,
+        application_id=application_id,
+        actor_user_id=current_user.id,
+    )
+
+    return ApplicationValidationReportResponse(
+        application_id=report["application_id"],
+        application_number=report["application_number"],
+        academic_year=report["academic_year"],
+        category=report["category"],
+        status=report["status"],
+        overall_compliance_score=report["overall_compliance_score"],
+        score_breakdown=report["score_breakdown"],
+        checklist_status=report["checklist_status"],
+        flag_summary=report["flag_summary"],
+        open_flags=[
+            ValidationFlagRead.model_validate(f, from_attributes=True)
+            for f in report["open_flags"]
+        ],
+        rectification_steps=report["rectification_steps"],
+        advisory_notes=report["advisory_notes"],
+        validated_at=report["validated_at"],
     )

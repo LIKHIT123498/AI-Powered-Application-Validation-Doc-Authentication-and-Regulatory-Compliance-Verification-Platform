@@ -22,6 +22,7 @@ from app.models.models import (
     ValidationFlag,
 )
 from app.schemas.schemas import (
+    AuthorityVerificationResponse,
     DocumentRead,
     DocumentUploadResponse,
     GeminiAIAnalysisResponse,
@@ -32,6 +33,7 @@ from app.services.gemini_service import analyze_document_with_gemini
 from app.services.ocr_service import compute_sha256, extract_pdf_intelligence
 from app.services.sample_pdf_generator import generate_demo_pdfs
 from app.services.security import get_current_user
+from app.services.verification_service import verify_document_with_issuing_authority
 
 router = APIRouter(
     prefix="/api",
@@ -560,6 +562,42 @@ def get_document_detail(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
+
+
+@router.post(
+    "/documents/{document_id}/verify-authority",
+    response_model=AuthorityVerificationResponse,
+)
+def verify_document_authority_endpoint(
+    document_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Authenticate document through original issuing-authority APIs,
+    official portals, digital repositories, QR codes, or URNs (PRD §4.3).
+    Logs status: VERIFIED, MISMATCH, EXPIRED, SOURCE_UNAVAILABLE, MANUAL_REVIEW_REQUIRED.
+    """
+    doc = session.get(Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    status_result, details, flags = verify_document_with_issuing_authority(
+        session=session,
+        document=doc,
+        actor_user_id=current_user.id,
+    )
+    return AuthorityVerificationResponse(
+        document_id=doc.id,
+        document_type=doc.document_type,
+        verification_status=status_result,
+        issuing_authority=doc.issuing_authority,
+        details=details,
+        flags_created=[
+            ValidationFlagRead.model_validate(f, from_attributes=True) for f in flags
+        ],
+        message=f"Issuing authority verification result: {status_result.value}",
+    )
 
 
 @router.get(

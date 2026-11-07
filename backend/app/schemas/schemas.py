@@ -182,3 +182,31 @@ class GeminiAIAnalysisResponse(BaseModel):
     new_flags_created: List[ValidationFlagRead]
 
 
+# --- Phase 4: Issuing-Authority & Application Validation Report Schemas ---
+class AuthorityVerificationResponse(BaseModel):
+    document_id: int
+    document_type: DocumentType
+    verification_status: VerificationStatus
+    issuing_authority: Optional[str] = None
+    details: Dict[str, Any]
+    flags_created: List[ValidationFlagRead]
+    message: str
+
+
+class ApplicationValidationReportResponse(BaseModel):
+    application_id: int
+    application_number: str
+    academic_year: str
+    category: str
+    status: str
+    overall_compliance_score: float
+    score_breakdown: Dict[str, float]
+    checklist_status: List[Dict[str, Any]]
+    flag_summary: Dict[str, int]
+    open_flags: List[ValidationFlagRead]
+    rectification_steps: List[str]
+    advisory_notes: str
+    validated_at: datetime
+
+
+
