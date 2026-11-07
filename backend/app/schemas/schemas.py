@@ -167,5 +167,18 @@ class DocumentUploadResponse(BaseModel):
     flags_generated: List[ValidationFlagRead]
     duplicate_detected: bool
     completeness_missing_fields: List[str]
+    ai_analysis: Optional[Dict[str, Any]] = None
     message: str
+
+
+class GeminiAIAnalysisResponse(BaseModel):
+    document_id: int
+    ai_provider: str
+    document_summary: str
+    authenticity_confidence_score: float
+    extracted_fields: Dict[str, Any]
+    infrastructure_observations: List[str]
+    advisory_recommendation: str
+    new_flags_created: List[ValidationFlagRead]
+
 

@@ -1,6 +1,6 @@
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlmodel import Session, select
 
@@ -17,22 +17,25 @@ from app.models.models import (
     Application,
     ChecklistRule,
     Document,
+    Institution,
     User,
     ValidationFlag,
 )
 from app.schemas.schemas import (
     DocumentRead,
     DocumentUploadResponse,
+    GeminiAIAnalysisResponse,
     ValidationFlagRead,
 )
 from app.services.audit_service import log_audit_event
+from app.services.gemini_service import analyze_document_with_gemini
 from app.services.ocr_service import compute_sha256, extract_pdf_intelligence
 from app.services.sample_pdf_generator import generate_demo_pdfs
 from app.services.security import get_current_user
 
 router = APIRouter(
     prefix="/api",
-    tags=["Document Upload, OCR & Forgery Forensics (PRD §4.1, §4.2)"],
+    tags=["Document Upload, OCR, Forgery Forensics & Gemini AI (PRD §4.1, §4.2, §4.4)"],
 )
 
 
@@ -50,14 +53,14 @@ def _parse_iso_or_common_date(date_str: Optional[str]) -> Optional[date]:
 @router.post("/documents/generate-sample-pdfs")
 def create_sample_pdfs_for_testing():
     """
-    Helper endpoint that generates 2 realistic AICTE sample PDFs in `backend/sample_docs/`:
+    Helper endpoint that generates 3 realistic AICTE sample PDFs in `backend/sample_docs/`:
     1. `valid_fire_safety_certificate.pdf` (clean metadata, consistent font, valid dates)
-    2. `tampered_affidavit_certificate.pdf` (edited in Photoshop/iLovePDF, 5 spliced fonts, post-issuance modDate)
-    Use the returned paths to test `POST /api/applications/{application_id}/documents` in Swagger UI!
+    2. `tampered_affidavit_certificate.pdf` (edited in Photoshop/iLovePDF, 5 spliced fonts, intake mismatch 600 vs 420)
+    3. `deficient_infrastructure_floorplan.pdf` (classroom 48 sqm < 66 sqm, built-up area 9200 vs 14800 sqm, no ramp/lift)
     """
     paths = generate_demo_pdfs(Path("sample_docs"))
     return {
-        "message": "Generated 2 sample PDFs for testing Phase 2 upload & forensic detection.",
+        "message": "Generated 3 sample PDFs for testing Phase 2 & Phase 3 pipelines.",
         "files": paths,
     }
 
@@ -70,20 +73,28 @@ def create_sample_pdfs_for_testing():
 async def upload_and_analyze_document(
     application_id: int,
     document_type: DocumentType = Form(..., description="AICTE Checklist Document Category"),
-    file: UploadFile = File(..., description="PDF document to upload and analyze"),
+    run_ai_analysis: bool = Form(
+        True,
+        description="Run Google Gemini 2.5 Flash structured extraction, cross-record & infrastructure compliance analysis",
+    ),
+    file: UploadFile = File(..., description="PDF or image document to upload and analyze"),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Uploads a supporting document for an application and immediately runs Phase 2 pipelines:
+    Uploads a supporting document for an application and runs Phase 2 & Phase 3 pipelines:
     1. SHA-256 duplicate submission detection across the platform.
     2. PyMuPDF (`fitz`) OCR text extraction, PDF metadata inspection & font splicing forensics.
-    3. Rule-based field completeness & expiry check against the matched `ChecklistRule`.
-    4. Immutable `AuditLog` recording of all extracted facts and explainable AI flags.
+    3. Google Gemini 2.5 Flash structured JSON extraction, historical AICTE cross-verification,
+       and infrastructure compliance assistance (PRD §4.1, §4.2, §4.4).
+    4. Rule-based field completeness & expiry check against the matched `ChecklistRule`.
+    5. Immutable `AuditLog` recording of all extracted facts and explainable AI flags.
     """
     application = session.get(Application, application_id)
     if not application:
         raise HTTPException(status_code=404, detail="Application not found")
+
+    institution = session.get(Institution, application.institution_id)
 
     file_bytes = await file.read()
     if not file_bytes:
@@ -104,17 +115,67 @@ async def upload_and_analyze_document(
     saved_path = app_upload_dir / f"{document_type.value}_{safe_filename}"
     saved_path.write_bytes(file_bytes)
 
-    # Run PyMuPDF OCR, Metadata & Font Forensics
+    # Phase 2: Run PyMuPDF OCR, Metadata & Font Forensics
     raw_text, pdf_metadata, extracted_fields, forensic_flags = extract_pdf_intelligence(
         file_bytes=file_bytes,
         filename=safe_filename,
     )
+
+    # Lookup matching ChecklistRule for this application's category & document_type
+    matched_rule = session.exec(
+        select(ChecklistRule)
+        .where(ChecklistRule.category == application.category)
+        .where(ChecklistRule.document_type == document_type)
+        .where(ChecklistRule.is_active == True)  # noqa: E712
+    ).first()
+
+    # Phase 3: Run Google Gemini 2.5 Flash Multimodal Structured Extraction & Anomaly Analysis
+    ai_analysis_output: Optional[Dict[str, Any]] = None
+    if run_ai_analysis:
+        inst_profile = (
+            {
+                "name": institution.name,
+                "aicte_permanent_id": institution.aicte_permanent_id,
+                "state": institution.state,
+                "district": institution.district,
+            }
+            if institution
+            else {}
+        )
+        hist_records = institution.historical_records if institution else {}
+        rule_cfg = matched_rule.model_dump() if matched_rule else {}
+
+        ai_analysis_output = analyze_document_with_gemini(
+            file_bytes=file_bytes,
+            mime_type=file.content_type or "application/pdf",
+            document_type=document_type,
+            raw_ocr_text=raw_text,
+            pdf_metadata=pdf_metadata,
+            baseline_extracted_fields=extracted_fields,
+            institution_profile=inst_profile,
+            historical_records=hist_records,
+            rule_config=rule_cfg,
+        )
+        # Merge Gemini structured fields into extracted_fields
+        for k, v in (ai_analysis_output.get("extracted_fields") or {}).items():
+            if v is not None and (k not in extracted_fields or extracted_fields.get(k) in (None, "")):
+                extracted_fields[k] = v
 
     doc_urn = (
         extracted_fields.get("certificate_number")
         or extracted_fields.get("eoa_reference_number")
         or extracted_fields.get("stamp_paper_number")
     )
+
+    verification_details: Dict[str, Any] = {}
+    if ai_analysis_output:
+        verification_details["ai_analysis"] = {
+            "ai_provider": ai_analysis_output["ai_provider"],
+            "document_summary": ai_analysis_output["document_summary"],
+            "authenticity_confidence_score": ai_analysis_output["authenticity_confidence_score"],
+            "infrastructure_observations": ai_analysis_output["infrastructure_observations"],
+            "advisory_recommendation": ai_analysis_output["advisory_recommendation"],
+        }
 
     document = Document(
         application_id=application.id,
@@ -132,18 +193,11 @@ async def upload_and_analyze_document(
         issue_date=extracted_fields.get("issue_date"),
         expiry_date=extracted_fields.get("expiry_date"),
         verification_status=VerificationStatus.PENDING,
+        verification_details=verification_details,
     )
     session.add(document)
     session.commit()
     session.refresh(document)
-
-    # Lookup matching ChecklistRule for this application's category & document_type
-    matched_rule = session.exec(
-        select(ChecklistRule)
-        .where(ChecklistRule.category == application.category)
-        .where(ChecklistRule.document_type == document_type)
-        .where(ChecklistRule.is_active == True)  # noqa: E712
-    ).first()
 
     created_flags: List[ValidationFlag] = []
 
@@ -183,7 +237,28 @@ async def upload_and_analyze_document(
         session.add(flag_obj)
         created_flags.append(flag_obj)
 
-    # 3. Check Required Fields & Expiry Date from Configurable ChecklistRule
+    # 3. Persist Gemini AI Semantic, Consistency & Infrastructure Flags (avoiding duplicate field+category)
+    if ai_analysis_output:
+        existing_keys = {(f.flag_category, f.field_name) for f in created_flags}
+        for ai_flag in ai_analysis_output.get("explainable_flags", []):
+            key = (ai_flag["flag_category"], ai_flag.get("field_name"))
+            if key not in existing_keys:
+                flag_obj = ValidationFlag(
+                    application_id=application.id,
+                    document_id=document.id,
+                    rule_id=matched_rule.id if matched_rule else None,
+                    flag_category=ai_flag["flag_category"],
+                    severity=ai_flag["severity"],
+                    field_name=ai_flag.get("field_name"),
+                    reason=ai_flag["reason"],
+                    evidence_snippet=ai_flag.get("evidence_snippet"),
+                    page_number=ai_flag.get("page_number", 1),
+                )
+                session.add(flag_obj)
+                created_flags.append(flag_obj)
+                existing_keys.add(key)
+
+    # 4. Check Required Fields & Expiry Date from Configurable ChecklistRule
     missing_fields: List[str] = []
     if matched_rule:
         for req_field in matched_rule.required_fields:
@@ -255,6 +330,11 @@ async def upload_and_analyze_document(
         "documents_uploaded": len(all_app_docs),
         "open_flags_count": len(all_app_flags),
         "last_uploaded_document": document_type.value,
+        "last_ai_confidence_score": (
+            ai_analysis_output["authenticity_confidence_score"]
+            if ai_analysis_output
+            else None
+        ),
         "last_updated_at": datetime.now(timezone.utc).isoformat(),
     }
     application.updated_at = datetime.now(timezone.utc)
@@ -265,20 +345,26 @@ async def upload_and_analyze_document(
     log_audit_event(
         session,
         application_id=application.id,
-        action_type="DOCUMENT_UPLOADED_AND_ANALYZED",
+        action_type="DOCUMENT_UPLOADED_AND_AI_ANALYZED",
         entity_type="Document",
         entity_id=str(document.id),
         actor=current_user,
         summary=(
             f"Uploaded '{safe_filename}' ({document_type.value}) for Application "
             f"{application.application_number}. Extracted {len(extracted_fields)} fields and "
-            f"generated {len(created_flags)} validation/forensic flag(s)."
+            f"generated {len(created_flags)} validation/AI flag(s)."
         ),
         details={
             "document_id": document.id,
             "document_type": document_type.value,
             "sha256_hash": sha256_digest,
             "duplicate_detected": duplicate_detected,
+            "ai_provider": ai_analysis_output["ai_provider"] if ai_analysis_output else "disabled",
+            "authenticity_confidence_score": (
+                ai_analysis_output["authenticity_confidence_score"]
+                if ai_analysis_output
+                else None
+            ),
             "extracted_fields": extracted_fields,
             "missing_required_fields": missing_fields,
             "flags_generated_count": len(created_flags),
@@ -294,10 +380,152 @@ async def upload_and_analyze_document(
         ],
         duplicate_detected=duplicate_detected,
         completeness_missing_fields=missing_fields,
+        ai_analysis=verification_details.get("ai_analysis"),
         message=(
-            f"Document processed via PyMuPDF OCR & forensics: {len(extracted_fields)} fields extracted, "
+            f"Document processed via PyMuPDF OCR & Gemini AI: {len(extracted_fields)} fields extracted, "
             f"{len(created_flags)} advisory flag(s) generated."
         ),
+    )
+
+
+@router.post(
+    "/documents/{document_id}/analyze-ai",
+    response_model=GeminiAIAnalysisResponse,
+)
+def run_gemini_analysis_on_existing_document(
+    document_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    On-demand endpoint to run (or re-run) Google Gemini 2.5 Flash Structured Extraction,
+    Cross-Record Consistency & Infrastructure Vision Compliance on an already uploaded document.
+    """
+    document = session.get(Document, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    application = session.get(Application, document.application_id)
+    institution = (
+        session.get(Institution, application.institution_id) if application else None
+    )
+    matched_rule = (
+        session.exec(
+            select(ChecklistRule)
+            .where(ChecklistRule.category == application.category)
+            .where(ChecklistRule.document_type == document.document_type)
+            .where(ChecklistRule.is_active == True)  # noqa: E712
+        ).first()
+        if application
+        else None
+    )
+
+    file_path = Path(document.file_path)
+    file_bytes = file_path.read_bytes() if file_path.exists() else b""
+
+    inst_profile = (
+        {
+            "name": institution.name,
+            "aicte_permanent_id": institution.aicte_permanent_id,
+            "state": institution.state,
+            "district": institution.district,
+        }
+        if institution
+        else {}
+    )
+    hist_records = institution.historical_records if institution else {}
+    rule_cfg = matched_rule.model_dump() if matched_rule else {}
+
+    ai_output = analyze_document_with_gemini(
+        file_bytes=file_bytes,
+        mime_type=document.mime_type,
+        document_type=document.document_type,
+        raw_ocr_text=document.raw_ocr_text or "",
+        pdf_metadata=document.pdf_metadata or {},
+        baseline_extracted_fields=document.extracted_fields or {},
+        institution_profile=inst_profile,
+        historical_records=hist_records,
+        rule_config=rule_cfg,
+    )
+
+    # Update extracted fields & verification_details on document
+    merged_fields = dict(document.extracted_fields or {})
+    merged_fields.update(ai_output.get("extracted_fields") or {})
+    document.extracted_fields = merged_fields
+
+    ver_details = dict(document.verification_details or {})
+    ver_details["ai_analysis"] = {
+        "ai_provider": ai_output["ai_provider"],
+        "document_summary": ai_output["document_summary"],
+        "authenticity_confidence_score": ai_output["authenticity_confidence_score"],
+        "infrastructure_observations": ai_output["infrastructure_observations"],
+        "advisory_recommendation": ai_output["advisory_recommendation"],
+    }
+    document.verification_details = ver_details
+    session.add(document)
+
+    # Persist any new AI flags not already recorded for this document
+    existing_doc_flags = session.exec(
+        select(ValidationFlag).where(ValidationFlag.document_id == document.id)
+    ).all()
+    existing_keys = {(f.flag_category, f.field_name) for f in existing_doc_flags}
+
+    new_flags: List[ValidationFlag] = []
+    for ai_flag in ai_output.get("explainable_flags", []):
+        key = (ai_flag["flag_category"], ai_flag.get("field_name"))
+        if key not in existing_keys:
+            flag_obj = ValidationFlag(
+                application_id=document.application_id,
+                document_id=document.id,
+                rule_id=matched_rule.id if matched_rule else None,
+                flag_category=ai_flag["flag_category"],
+                severity=ai_flag["severity"],
+                field_name=ai_flag.get("field_name"),
+                reason=ai_flag["reason"],
+                evidence_snippet=ai_flag.get("evidence_snippet"),
+                page_number=ai_flag.get("page_number", 1),
+            )
+            session.add(flag_obj)
+            new_flags.append(flag_obj)
+            existing_keys.add(key)
+
+    session.commit()
+    for nf in new_flags:
+        session.refresh(nf)
+
+    log_audit_event(
+        session,
+        application_id=document.application_id,
+        action_type="GEMINI_AI_ANALYSIS_EXECUTED",
+        entity_type="Document",
+        entity_id=str(document.id),
+        actor=current_user,
+        actor_role_override="AI_ENGINE",
+        summary=(
+            f"Executed AI structured analysis ({ai_output['ai_provider']}) on Document #{document.id} "
+            f"({document.document_type.value}). Confidence: {ai_output['authenticity_confidence_score']}. "
+            f"New flags added: {len(new_flags)}."
+        ),
+        details={
+            "ai_provider": ai_output["ai_provider"],
+            "authenticity_confidence_score": ai_output["authenticity_confidence_score"],
+            "new_flags_count": len(new_flags),
+            "infrastructure_observations": ai_output["infrastructure_observations"],
+        },
+    )
+
+    return GeminiAIAnalysisResponse(
+        document_id=document.id,
+        ai_provider=ai_output["ai_provider"],
+        document_summary=ai_output["document_summary"],
+        authenticity_confidence_score=ai_output["authenticity_confidence_score"],
+        extracted_fields=merged_fields,
+        infrastructure_observations=ai_output["infrastructure_observations"],
+        advisory_recommendation=ai_output["advisory_recommendation"],
+        new_flags_created=[
+            ValidationFlagRead.model_validate(f, from_attributes=True)
+            for f in new_flags
+        ],
     )
 
 

@@ -128,7 +128,53 @@ def generate_demo_pdfs(output_dir: Path = Path("sample_docs")) -> Dict[str, str]
     doc_tampered.save(str(tampered_path))
     doc_tampered.close()
 
+    # 3. Generate Infrastructure Floor Plan & Compliance Report PDF (triggers Phase 3 AI Infrastructure & Consistency Flags)
+    infra_path = output_dir / "deficient_infrastructure_floorplan.pdf"
+    doc_infra = fitz.open()
+    page_i = doc_infra.new_page(width=595, height=842)
+
+    infra_lines = [
+        "ARCHITECTURAL FLOOR PLAN & INFRASTRUCTURE COMPLIANCE SCHEDULE",
+        "------------------------------------------------------------------------",
+        "Institution Name: Apex Institute of Engineering and Technology",
+        "AICTE Permanent ID: 1-4928173650",
+        "Academic Year: 2026-27",
+        "Issuing Authority: Certified Chartered Architect (COA Reg. CA/2018/90421)",
+        "Issue Date: 2026-07-01",
+        "",
+        "SUMMARY OF MEASURED INFRASTRUCTURE PARAMETERS:",
+        "Built-up Area: 9200 sqm",
+        "Classrooms Count: 18",
+        "Minimum Classroom Area: 48 sqm",
+        "Laboratories Count: 6",
+        "Minimum Laboratory Area: 52 sqm",
+        "Barrier-Free Environment: Not Available (No Ramp / Lift in Academic Block B)",
+        "",
+        "ARCHITECT OBSERVATION:",
+        "Classrooms C-101 through C-106 measure 48 sqm each (below 66 sqm AICTE norm).",
+        "Total measured built-up area is 9200 sqm.",
+    ]
+
+    y = 72
+    for line in infra_lines:
+        page_i.insert_text((54, y), line, fontsize=11, fontname="helv")
+        y += 22
+
+    doc_infra.set_metadata(
+        {
+            "title": "Architectural Floor Plan & Infrastructure Report",
+            "author": "Chartered Architect Associates",
+            "creator": "AutoCAD PDF Exporter 2026",
+            "producer": "AutoCAD PDF Library",
+            "creationDate": "D:20260701110000Z",
+            "modDate": "D:20260701110005Z",
+        }
+    )
+    doc_infra.save(str(infra_path))
+    doc_infra.close()
+
     return {
         "valid_pdf": str(valid_path.resolve()),
         "tampered_pdf": str(tampered_path.resolve()),
+        "deficient_infrastructure_pdf": str(infra_path.resolve()),
     }
