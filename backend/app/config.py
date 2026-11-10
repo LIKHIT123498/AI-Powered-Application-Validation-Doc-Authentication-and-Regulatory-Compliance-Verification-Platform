@@ -23,7 +23,11 @@ class Settings(BaseSettings):
     UPLOAD_DIR: Path = Path("uploads")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=[
+            Path(__file__).resolve().parent.parent / ".env",
+            ".env",
+            "backend/.env",
+        ],
         env_file_encoding="utf-8",
         extra="ignore",
     )
